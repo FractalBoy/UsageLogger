@@ -18,6 +18,31 @@ namespace UsageLogger
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct Rect
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [DllImport("gdi32.dll")]
+        public static extern int GetDeviceCaps(IntPtr hdc, int nIndex);
+        public enum DeviceCap
+        {
+            VERTRES = 10,
+            DESKTOPVERTRES = 117,
+
+            // http://pinvoke.net/default.aspx/gdi32/GetDeviceCaps.html
+        }
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetWindowRect(IntPtr hWnd, ref Rect rect);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetClientRect(IntPtr hWnd, ref Rect rect);
+
         [DllImport("user32.dll")]
         public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
@@ -32,6 +57,11 @@ namespace UsageLogger
             }
 
             GetWindowThreadProcessId(handle, out uint pid);
+
+            if (pid == 0)
+            {
+                return null;
+            }
 
             var process = Process.GetProcessById((int)pid);
             string exePath = process.MainModule.FileName;
