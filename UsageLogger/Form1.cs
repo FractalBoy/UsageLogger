@@ -1,11 +1,13 @@
 ﻿using System;
 using System.Data;
 using System.Data.SQLite;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Windows.Forms;
+using System.Windows.Forms.DataVisualization.Charting;
 using static UsageLogger.NativeMethods;
 
 namespace UsageLogger
@@ -13,51 +15,62 @@ namespace UsageLogger
     public partial class Form1 : Form
     {
         WinEventDelegate dele = null;
-        Timer timer;
-        DataTable dataTable = new DataTable();
+        PicturePanel picturePanel = null;
 
         public Form1()
         {
             InitializeComponent();
             dele = new WinEventDelegate(WinEventProc);
             IntPtr m_hhook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, dele, 0, 0, WINEVENT_OUTOFCONTEXT);
-            timer = new Timer();
-            timer.Interval = 5000;
-            timer.Start();
-            timer.Tick += Timer_Tick;
 
-            dataTable.Columns.Add("Id", typeof(int));
-            dataTable.Columns.Add("Start", typeof(DateTime));
-            dataTable.Columns.Add("End", typeof(DateTime));
-            dataTable.Columns.Add("ProgramName", typeof(string));
-            dataTable.Columns.Add("Screenshot", typeof(byte[]));
-            dataTable.PrimaryKey = new[] { dataTable.Columns[0] };
+            chart1.Dock = DockStyle.Fill;
+            chart1.ChartAreas[0].AxisY.LabelStyle.Format = "HH:mm:ss";
+            chart1.ChartAreas[0].AxisY.IntervalAutoMode = IntervalAutoMode.VariableCount;
+            chart1.ChartAreas[0].AxisY.IntervalType = DateTimeIntervalType.Minutes;
 
-            dataGridView1.DataSource = dataTable;
+            Application.ApplicationExit += Application_ApplicationExit;
+
             GetData();
+        }
+
+        private void Application_ApplicationExit(object sender, EventArgs e)
+        {
+            using (var context = new WindowLoggingContext())
+            {
+                var noEnd = context.WindowLogs.FirstOrDefault(p => !p.End.HasValue);
+
+                if (noEnd != null)
+                {
+                    noEnd.End = DateTime.Now;
+                    context.SaveChanges();
+                }
+            }
         }
 
         private void GetData()
         {
+            chart1.Series.Clear();
+
             using (var context = new WindowLoggingContext())
             {
-                var dataAdapter = new SQLiteDataAdapter(@"
-                    SELECT
-                        s.Id,
-                        w.Start,
-                        w.End,
-                        w.ProgramName,
-                        s.Image as Screenshot
-                    FROM Screenshots s
-                    JOIN WindowLogs w
-                        ON s.WindowLog_Id = w.Id
-                ", context.Database.Connection.ConnectionString);
+                foreach (var log in context.WindowLogs.OrderBy(p => p.Start).ToList())
+                {
+                    var end = log.End;
 
-                dataTable.Clear();
-                dataAdapter.Fill(dataTable);
+                    if (end == null)
+                    {
+                        continue;
+                    }
+
+                    var series = new Series { ChartType = SeriesChartType.RangeBar };
+                    chart1.Series.Add(series);
+                    series.Points.AddXY(0, log.Start, end);
+                    series.Points[0]["LogId"] = log.Id.ToString();
+                    series.AxisLabel = "Usage";
+                    series.IsVisibleInLegend = false;
+                    series["DrawSideBySide"] = "false";
+                }
             }
-
-            dataGridView1.AutoResizeColumns(DataGridViewAutoSizeColumnsMode.AllCellsExceptHeader);
         }
 
         private byte[] TakeScreenshot()
@@ -69,7 +82,7 @@ namespace UsageLogger
             GetClientRect(currentWindow, ref cliRect);
             int diffX = winRect.Right - winRect.Left - cliRect.Right + cliRect.Left;
             int diffY = winRect.Bottom - winRect.Top - cliRect.Bottom + cliRect.Top;
-            var bounds = new Rectangle(winRect.Left + diffX /2 , winRect.Top, winRect.Right - winRect.Left - diffX, winRect.Bottom - winRect.Top - diffY);
+            var bounds = new Rectangle(winRect.Left + diffX / 2, winRect.Top, winRect.Right - winRect.Left - diffX, winRect.Bottom - winRect.Top - diffY);
             var memoryStream = new MemoryStream();
 
             if (bounds.Width == 0 || bounds.Height == 0)
@@ -77,39 +90,18 @@ namespace UsageLogger
                 return null;
             }
 
-            using (var bitmap = new Bitmap(bounds.Width, bounds.Height))
-            using (var graphics = Graphics.FromImage(bitmap))
+            try
             {
-                graphics.CopyFromScreen(new Point(bounds.Left, bounds.Top), Point.Empty, bounds.Size);
-                bitmap.Save(memoryStream, ImageFormat.Jpeg);
+                using (var bitmap = new Bitmap(bounds.Width, bounds.Height))
+                using (var graphics = Graphics.FromImage(bitmap))
+                {
+                    graphics.CopyFromScreen(new Point(bounds.Left, bounds.Top), Point.Empty, bounds.Size);
+                    bitmap.Save(memoryStream, ImageFormat.Jpeg);
+                }
             }
+            catch { return null; }
 
             return memoryStream.ToArray();
-        }
-
-        private void Timer_Tick(object sender, EventArgs e)
-        {
-            var imageBytes = TakeScreenshot();
-
-            if (imageBytes == null)
-            {
-                return;
-            }
-
-            using (var context = new WindowLoggingContext())
-            {
-                var currLog = context.WindowLogs.FirstOrDefault(p => !p.End.HasValue);
-
-                if (currLog == null)
-                {
-                    return;
-                }
-
-                context.Screenshots.Add(new Screenshot { Image = imageBytes, WindowLog_Id = currLog.Id });
-                context.SaveChanges();
-            }
-
-            GetData();
         }
 
         void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
@@ -155,24 +147,49 @@ namespace UsageLogger
             GetData();
         }
 
-        private void DataGridView1_CellContentClick(object sender, DataGridViewCellEventArgs e)
+        private void Chart1_MouseMove(object sender, MouseEventArgs e)
         {
-            var gridView = (DataGridView)sender;
-            var cell = gridView[e.ColumnIndex, e.RowIndex];
+            var result = chart1.HitTest(e.X, e.Y);
 
-            // Open up popup with image
-            if (cell.OwningColumn.Name == "Screenshot" && typeof(Image).IsAssignableFrom(cell.FormattedValueType))
+            if (picturePanel != null)
             {
-                var imageCell = (DataGridViewImageCell)cell;
-                var pictureBox = new PictureBox();
-                var image = (Image)imageCell.FormattedValue;
-                pictureBox.Image = image;
-                pictureBox.Size = image.Size;
-                var imagePopup = new Form();
-                imagePopup.AutoSizeMode = AutoSizeMode.GrowOnly;
-                imagePopup.AutoSize = true;
-                imagePopup.Controls.Add(pictureBox);
-                imagePopup.ShowDialog();
+                picturePanel.Hide();
+                Controls.Remove(picturePanel);
+                picturePanel.Dispose();
+                picturePanel = null;
+            }
+
+            if (result.Object is DataPoint)
+            {
+                var dataPoint = (DataPoint)result.Object;
+                var logId = int.Parse(dataPoint["LogId"]);
+                MemoryStream stream;
+
+                using (var context = new WindowLoggingContext())
+                {
+                    var screenshot = context.WindowLogs
+                        .Join(context.Screenshots,
+                        w => w.Id,
+                        s => s.WindowLog_Id,
+                        (w, s) => new { w.Id, w.Start, w.End, w.ProgramName, s.Image })
+                        .FirstOrDefault(p => p.Id == logId);
+
+                    if(screenshot == null)
+                    {
+                        return;
+                    }
+
+                    stream = new MemoryStream(screenshot.Image);
+                }
+
+                picturePanel = new PicturePanel(new Bitmap(stream));
+                Controls.Add(picturePanel);
+                picturePanel.Width = 1280;
+                picturePanel.Height = 720;
+                picturePanel.Location = e.Location;
+                picturePanel.Show();
+                picturePanel.BringToFront();
+                return;
             }
         }
     }
